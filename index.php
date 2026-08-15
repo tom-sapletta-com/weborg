@@ -34,6 +34,14 @@ if (!is_dir($orgPath)) {
 
 $cacheFile = $currentDir . '/cache_' . $selectedOrg . '.json';
 
+// --- PLESK / CLI DAILY STATIC EXPORT MODE ---
+$isCli = (php_sapi_name() === 'cli');
+$isExport = $isCli || (isset($_GET['export']) && $_GET['export'] == '1') || (isset($argv[1]) && in_array($argv[1], ['--export', 'export', '-e', 'build']));
+
+if ($isExport) {
+    ob_start();
+}
+
 // --- API HANDLING ---
 if (isset($_GET['api'])) {
     header('Content-Type: application/json; charset=utf-8');
@@ -637,3 +645,17 @@ sort($allAvailableOrgs);
   </script>
 </body>
 </html>
+<?php
+if ($isExport) {
+    $htmlOutput = ob_get_clean();
+    $exportHtmlFile = $currentDir . '/index.html';
+    file_put_contents($exportHtmlFile, $htmlOutput);
+    if ($isCli) {
+        echo "[Plesk Daily Export] Wygenerowano plik statyczny index.html dla organizacji '{$selectedOrg}' (" . round(strlen($htmlOutput) / 1024) . " KB)\n";
+        exit(0);
+    } else {
+        echo $htmlOutput;
+        exit(0);
+    }
+}
+?>
