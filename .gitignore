@@ -1,0 +1,8 @@
+# Cache files
+cache_*.json
+*.cache.json
+
+# Environment & Temp
+.DS_Store
+*.log
+.env

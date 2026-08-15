@@ -1,0 +1,19 @@
+{
+  "name": "weborg",
+  "version": "1.0.0",
+  "description": "Uniwersalny, reużywalny silnik jednoplikowy index.php dla Landing Page i Hubu Organizacji GitHub",
+  "main": "index.php",
+  "scripts": {
+    "dev": "php -S localhost:8000 index.php"
+  },
+  "keywords": [
+    "weborg",
+    "single-file",
+    "php",
+    "landing-page",
+    "cytoscape",
+    "github-cache"
+  ],
+  "author": "WebOrg Team",
+  "license": "MIT"
+}
