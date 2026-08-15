@@ -1,0 +1,50 @@
+name: Daily Static Export & GitHub Pages Deploy
+on:
+  schedule:
+    - cron: '0 2 * * *'
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+jobs:
+  build-and-export:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup PHP Environment
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+
+      - name: Run Single-File Static HTML Exporter
+        run: php index.php --export
+
+      - name: Commit & Push Updated Static index.html
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action Bot"
+          git add index.html cache_*.json || true
+          git diff --quiet && git diff --staged --quiet || (git commit -m "auto: Daily static index.html export [skip ci]" && git push)
+
+  deploy-pages:
+    needs: build-and-export
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+      - name: Setup Pages
+        uses: actions/configure-pages@v4
+      - name: Upload Artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: '.'
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
