@@ -56,3 +56,6 @@ Distributed under the MIT License.
 ## Validation and recovered export
 
 See [ticket 001](docs/ticket-001-secure-export.md) for transport safety, offline tests, and preserved publication work.
+
+For safe discovery and explicit execution of Plesk exports, see
+[the cron helper instructions](docs/ticket-003-safe-plesk-cron.md).
