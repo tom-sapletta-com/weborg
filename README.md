@@ -59,3 +59,6 @@ See [ticket 001](docs/ticket-001-secure-export.md) for transport safety, offline
 
 For safe discovery and explicit execution of Plesk exports, see
 [the cron helper instructions](docs/ticket-003-safe-plesk-cron.md).
+
+For effect-free domain plans and explicitly scoped Pages updates, see
+[the domain helper instructions](docs/ticket-005-safe-pages-domain.md).

@@ -11,4 +11,4 @@ cache_*.json
 /.worktrees/
 /.subactor/
 /_site/
-/tests/__pycache__/
+__pycache__/
