@@ -1,5 +1,6 @@
 name: Daily Static Export & GitHub Pages Deploy
 on:
+  pull_request:
   schedule:
     - cron: '0 2 * * *'
   push:
@@ -11,8 +12,27 @@ permissions:
   pages: write
   id-token: write
 
+concurrency:
+  group: weborg-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
-  build-and-export:
+  validate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+      - run: php -l index.php
+      - run: php tests/http_transport.php
+      - run: python3 -m unittest discover -s tests -p 'test_*.py'
+
+  export-and-deploy:
+    if: github.event_name != 'pull_request'
+    needs: validate
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository
@@ -24,27 +44,34 @@ jobs:
           php-version: '8.3'
 
       - name: Run Single-File Static HTML Exporter
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: php index.php --export
 
       - name: Commit & Push Updated Static index.html
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action Bot"
-          git add index.html cache_*.json || true
-          git diff --quiet && git diff --staged --quiet || (git commit -m "auto: Daily static index.html export [skip ci]" && git push)
+          git add index.html
+          if ! git diff --staged --quiet; then
+            git commit -m "auto: Daily static index.html export [skip ci]"
+            git push
+          fi
 
-  deploy-pages:
-    needs: build-and-export
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
       - name: Setup Pages
         uses: actions/configure-pages@v4
+
+      - name: Stage Static Pages Files
+        run: |
+          mkdir -p _site
+          cp index.html _site/index.html
+          if [ -f CNAME ]; then cp CNAME _site/CNAME; fi
+
       - name: Upload Artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: '.'
+          path: '_site'
+
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4

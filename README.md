@@ -52,3 +52,7 @@ Skopiuj plik `index.php` do dowolnego folderu (np. `/home/tom/github/dowolna-org
 ## 📄 Licencja
 
 Distributed under the MIT License.
+
+## Validation and recovered export
+
+See [ticket 001](docs/ticket-001-secure-export.md) for transport safety, offline tests, and preserved publication work.
