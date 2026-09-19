@@ -12,22 +12,57 @@ error_reporting(E_ALL & ~E_NOTICE);
 // Status Cache TTL: 24 Godziny (86400 sekund)
 define('CACHE_TTL', 86400);
 
-$baseGithubDir = dirname(__DIR__); // /home/tom/github
 $currentDir = __DIR__;
-$currentOrgName = basename(dirname($currentDir));
+$parentDirName = basename(dirname($currentDir));
+$grandParentDir = dirname(dirname($currentDir));
+$baseGithubDir = is_dir($grandParentDir) ? $grandParentDir : dirname(__DIR__);
 
-// Pobierz parametry z URL
+$invalidOrgs = ['www', 'work', '_actions', '_temp', '_PipelineMapping'];
+
+// 1. Pobierz org z URL jeśli podano
 $selectedOrg = isset($_GET['org']) ? preg_replace('/[^a-zA-Z0-9_-]/', '', $_GET['org']) : '';
-if (!$selectedOrg || !is_dir($baseGithubDir . '/' . $selectedOrg)) {
-    // Sprawdź czy bieżący katalog rodzica to organizacja
-    if (basename($currentDir) === 'www' && is_dir(dirname($currentDir))) {
-        $selectedOrg = basename(dirname($currentDir));
-    } else {
-        $selectedOrg = 'wellmanifest'; // Domyślna organizacja
+
+// 2. Jeśli brak, sprawdź zmienną środowiskową GITHUB_REPOSITORY z GitHub Actions
+if (!$selectedOrg || in_array($selectedOrg, $invalidOrgs)) {
+    $ghRepoEnv = getenv('GITHUB_REPOSITORY');
+    if ($ghRepoEnv && strpos($ghRepoEnv, '/') !== false) {
+        $parts = explode('/', $ghRepoEnv);
+        if (!empty($parts[0]) && !in_array($parts[0], $invalidOrgs)) {
+            $selectedOrg = $parts[0];
+        }
     }
 }
 
-$orgPath = $baseGithubDir . '/' . $selectedOrg;
+// 3. Jeśli nadal brak, sprawdź URL git remote origin
+if (!$selectedOrg || in_array($selectedOrg, $invalidOrgs)) {
+    $gitRemote = @shell_exec('git remote get-url origin 2>/dev/null');
+    if ($gitRemote && preg_match('/[:\/]([a-zA-Z0-9_-]+)\/([a-zA-Z0-9_-]+)(\.git)?/', trim($gitRemote), $matches)) {
+        if (!empty($matches[1]) && !in_array($matches[1], $invalidOrgs)) {
+            $selectedOrg = $matches[1];
+        }
+    }
+}
+
+// 4. Jeśli nadal brak, sprawdź katalog nadrzędny
+if (!$selectedOrg || in_array($selectedOrg, $invalidOrgs)) {
+    $dirParts = array_filter(explode('/', str_replace('\\', '/', $currentDir)));
+    foreach (array_reverse($dirParts) as $part) {
+        if (!in_array($part, $invalidOrgs) && strpos($part, '_') !== 0 && strpos($part, '.') !== 0) {
+            $selectedOrg = $part;
+            break;
+        }
+    }
+}
+
+if (!$selectedOrg || in_array($selectedOrg, $invalidOrgs)) {
+    $selectedOrg = 'wellmanifest'; // Domyślna organizacja
+}
+
+if ($selectedOrg === $parentDirName) {
+    $orgPath = dirname($currentDir);
+} else {
+    $orgPath = $baseGithubDir . '/' . $selectedOrg;
+}
 if (!is_dir($orgPath)) {
     $orgPath = $currentDir;
 }
@@ -55,14 +90,86 @@ if (isset($_GET['api'])) {
     }
 }
 
+function httpGetJson($url) {
+    // Never forward credentials to another host, insecure transport or redirect.
+    $parts = parse_url($url);
+    if (!$parts || ($parts['scheme'] ?? '') !== 'https'
+        || strtolower($parts['host'] ?? '') !== 'api.github.com'
+        || isset($parts['user']) || isset($parts['pass'])
+        || (isset($parts['port']) && $parts['port'] !== 443)) {
+        return null;
+    }
+    $token = getenv('GITHUB_TOKEN');
+    $userAgent = 'WebOrg-PHP-AutoDiscovery/1.0';
+    $headers = ["User-Agent: {$userAgent}", 'Accept: application/vnd.github+json'];
+    if ($token) {
+        $headers[] = "Authorization: Bearer {$token}";
+    }
+
+    if (function_exists('curl_init')) {
+        $ch = curl_init();
+        curl_setopt($ch, CURLOPT_URL, $url);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_USERAGENT, $userAgent);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, true);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, 2);
+        curl_setopt($ch, CURLOPT_FOLLOWLOCATION, false);
+        curl_setopt($ch, CURLOPT_TIMEOUT, 15);
+        curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
+        $res = curl_exec($ch);
+        $status = curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+        curl_close($ch);
+        // A failed TLS/HTTP request must not downgrade to another transport.
+        if ($res === false || $status < 200 || $status >= 300) return null;
+        $data = json_decode($res, true);
+        return is_array($data) ? $data : null;
+    }
+
+    $context = stream_context_create([
+        'http' => [
+            'method' => 'GET',
+            'header' => implode("\r\n", $headers) . "\r\n",
+            'ignore_errors' => true,
+            'follow_location' => 0,
+            'timeout' => 15,
+        ],
+        'ssl' => ['verify_peer' => true, 'verify_peer_name' => true],
+    ]);
+    $stream = @fopen($url, 'rb', false, $context);
+    if ($stream === false) return null;
+    try {
+        $metadata = stream_get_meta_data($stream);
+        $status = 0;
+        foreach ($metadata['wrapper_data'] ?? [] as $header) {
+            if (preg_match('~^HTTP/\S+ (\d{3})(?: |$)~', $header, $match)) {
+                $status = (int) $match[1];
+            }
+        }
+        if ($status < 200 || $status >= 300) return null;
+        $json = stream_get_contents($stream);
+        if ($json === false) return null;
+        $data = json_decode($json, true);
+        return is_array($data) ? $data : null;
+    } finally {
+        fclose($stream);
+    }
+}
+
+function fetchGitHubOrgRepos($orgName) {
+    $data = httpGetJson("https://api.github.com/orgs/{$orgName}/repos?per_page=100");
+    if (is_array($data) && array_is_list($data)) return $data;
+    $data = httpGetJson("https://api.github.com/users/{$orgName}/repos?per_page=100");
+    return is_array($data) && array_is_list($data) ? $data : null;
+}
+
 // --- FUNKCJA AUTOMATYCZNEGO ODKRYWANIA REPOZYTORIÓW I CACHE ---
-function getOrGenerateProjectsCache($orgName, $orgPath, $cacheFile) {
-    if (file_exists($cacheFile)) {
+function getOrGenerateProjectsCache($orgName, $orgPath, $cacheFile, $forceRefresh = false) {
+    if (!$forceRefresh && file_exists($cacheFile)) {
         $age = time() - filemtime($cacheFile);
         if ($age < CACHE_TTL) {
             $json = file_get_contents($cacheFile);
             $data = json_decode($json, true);
-            if ($data && isset($data['projects'])) {
+            if ($data && isset($data['projects']) && count($data['projects']) > 0) {
                 return $data;
             }
         }
@@ -74,60 +181,117 @@ function getOrGenerateProjectsCache($orgName, $orgPath, $cacheFile) {
         $scan = scandir($orgPath);
         foreach ($scan as $item) {
             if ($item === '.' || $item === '..' || $item === 'www' || strpos($item, '.') === 0) continue;
-            if (is_dir($orgPath . '/' . $item)) {
+            if (is_dir($orgPath . '/' . $item)
+                && file_exists($orgPath . '/' . $item . '/.git')) {
                 $subdirs[] = $item;
             }
         }
     }
 
     $projects = [];
-    foreach ($subdirs as $projId) {
-        $projPath = $orgPath . '/' . $projId;
-        $readmeFile = $projPath . '/README.md';
-        $readmeContent = file_exists($readmeFile) ? file_get_contents($readmeFile) : '';
 
-        // Parsowanie nagłówka i opisu
-        $lines = array_filter(array_map('trim', explode("\n", $readmeContent)));
-        $title = !empty($lines) ? trim(str_replace('#', '', reset($lines))) : $projId;
-        
-        $desc = '';
-        foreach (array_slice($lines, 1, 6) as $l) {
-            if (strpos($l, '#') !== 0 && strpos($l, '![') !== 0 && strlen($l) > 10) {
-                $desc = $l;
-                break;
+    // Pobierz prawdziwe statystyki z GitHub REST API
+    $ghStatsMap = [];
+    $apiRepos = fetchGitHubOrgRepos($orgName);
+    if ($apiRepos === null && empty($subdirs)) {
+        throw new RuntimeException('GitHub API unavailable; previous export and cache preserved');
+    }
+    foreach ($apiRepos ?? [] as $repo) {
+        if (!empty($repo['name'])) {
+            $ghStatsMap[$repo['name']] = [
+                'stars' => $repo['stargazers_count'] ?? 0,
+                'forks' => $repo['forks_count'] ?? 0,
+                'issues' => $repo['open_issues_count'] ?? 0,
+                'language' => $repo['language'] ?? 'Python',
+                'description' => $repo['description'] ?? '',
+                'html_url' => $repo['html_url'] ?? "https://github.com/$orgName/{$repo['name']}"
+            ];
+        }
+    }
+
+    if (!empty($subdirs)) {
+        foreach ($subdirs as $projId) {
+            $projPath = $orgPath . '/' . $projId;
+            $readmeFile = $projPath . '/README.md';
+            $readmeContent = file_exists($readmeFile) ? file_get_contents($readmeFile) : '';
+
+            $lines = array_filter(array_map('trim', explode("\n", $readmeContent)));
+            $title = !empty($lines) ? trim(str_replace('#', '', reset($lines))) : $projId;
+
+            $desc = '';
+            foreach (array_slice($lines, 1, 6) as $l) {
+                if (strpos($l, '#') !== 0 && strpos($l, '![') !== 0 && strlen($l) > 10) {
+                    $desc = $l;
+                    break;
+                }
             }
-        }
-        if (!$desc) {
-            $desc = "Moduł $projId — komponent wykonawczy i automatyzacyjny w ekosystemie $orgName.";
-        }
+            if (!$desc) {
+                $desc = "Moduł $projId — komponent wykonawczy i automatyzacyjny w ekosystemie $orgName.";
+            }
 
-        // Generowanie tagów
-        $tags = [$orgName, 'module'];
-        if (preg_match('/(connector|adapter|link)/i', $projId)) $tags[] = 'connector';
-        if (preg_match('/(nlp|llm|ai|agent)/i', $projId)) $tags[] = 'ai';
-        if (preg_match('/(dsl|grammar|schema|parser)/i', $projId)) $tags[] = 'dsl';
-        if (preg_match('/(uri|url|route)/i', $projId)) $tags[] = 'uri';
-        if (preg_match('/(stream|event|queue)/i', $projId)) $tags[] = 'stream';
-        if (preg_match('/(lifecycle|state)/i', $projId)) $tags[] = 'lifecycle';
-        if (preg_match('/(sec|auth|guard|identity)/i', $projId)) $tags[] = 'security';
+            $tags = [$orgName, 'module'];
+            if (preg_match('/(connector|adapter|link)/i', $projId)) $tags[] = 'connector';
+            if (preg_match('/(nlp|llm|ai|agent)/i', $projId)) $tags[] = 'ai';
+            if (preg_match('/(dsl|grammar|schema|parser)/i', $projId)) $tags[] = 'dsl';
+            if (preg_match('/(uri|url|route)/i', $projId)) $tags[] = 'uri';
+            if (preg_match('/(stream|event|queue)/i', $projId)) $tags[] = 'stream';
+            if (preg_match('/(lifecycle|state)/i', $projId)) $tags[] = 'lifecycle';
+            if (preg_match('/(sec|auth|guard|identity)/i', $projId)) $tags[] = 'security';
 
-        $projects[$projId] = [
-            'id' => $projId,
-            'name' => (strlen($title) < 45) ? $title : $projId,
-            'task' => $desc,
-            'category' => 'Moduły & Usługi',
-            'tags' => array_values(array_unique($tags)),
-            'status' => 'Aktywny Moduł',
-            'stars' => (strlen($projId) * 11 + 7) % 120 + 15,
-            'forks' => (strlen($projId) * 3 + 2) % 25 + 2,
-            'issues' => strlen($projId) % 4,
-            'language' => preg_match('/(py|nlp|ai)/i', $projId) ? 'Python' : (preg_match('/(ts|js|web)/i', $projId) ? 'TypeScript' : 'Python'),
-            'owner' => $orgName,
-            'readme' => $readmeContent,
-            'github_url' => "https://github me/$orgName/$projId",
-            'dependencies' => [],
-            'used_by' => []
-        ];
+            $ghData = $ghStatsMap[$projId] ?? [];
+            $realStars = $ghData['stars'] ?? 0;
+            $realForks = $ghData['forks'] ?? 0;
+            $realIssues = $ghData['issues'] ?? 0;
+            $realLang = $ghData['language'] ?? (preg_match('/(ts|js|web)/i', $projId) ? 'TypeScript' : 'Python');
+
+            $projects[$projId] = [
+                'id' => $projId,
+                'name' => (strlen($title) < 45) ? $title : $projId,
+                'task' => $desc,
+                'category' => 'Moduły & Usługi',
+                'tags' => array_values(array_unique($tags)),
+                'status' => 'Aktywny Moduł',
+                'stars' => $realStars,
+                'forks' => $realForks,
+                'issues' => $realIssues,
+                'language' => $realLang,
+                'owner' => $orgName,
+                'readme' => $readmeContent,
+                'github_url' => "https://github.com/$orgName/$projId",
+                'dependencies' => [],
+                'used_by' => []
+            ];
+        }
+    } else {
+        // Fallback do GitHub REST API jeśli brak lokalnych subkatalogów
+        foreach ($apiRepos as $repo) {
+            $projId = $repo['name'] ?? '';
+            if (!$projId || $projId === 'www') continue;
+
+            $desc = $repo['description'] ?? "Moduł $projId w ekosystemie $orgName.";
+            $tags = [$orgName, 'module'];
+            if (preg_match('/(connector|adapter|link)/i', $projId)) $tags[] = 'connector';
+            if (preg_match('/(nlp|llm|ai|agent)/i', $projId)) $tags[] = 'ai';
+            if (preg_match('/(dsl|grammar|schema|parser)/i', $projId)) $tags[] = 'dsl';
+
+            $projects[$projId] = [
+                'id' => $projId,
+                'name' => $projId,
+                'task' => $desc,
+                'category' => 'Moduły & Usługi',
+                'tags' => array_values(array_unique($tags)),
+                'status' => 'Aktywny Moduł',
+                'stars' => $repo['stargazers_count'] ?? 0,
+                'forks' => $repo['forks_count'] ?? 0,
+                'issues' => $repo['open_issues_count'] ?? 0,
+                'language' => $repo['language'] ?? 'Python',
+                'owner' => $orgName,
+                'readme' => "# $projId\n\n$desc\n\n[Kod na GitHub]({$repo['html_url']})",
+                'github_url' => $repo['html_url'] ?? "https://github.com/$orgName/$projId",
+                'dependencies' => [],
+                'used_by' => []
+            ];
+        }
     }
 
     // Wykrywanie relacji zależności
@@ -165,16 +329,17 @@ function getOrGenerateProjectsCache($orgName, $orgPath, $cacheFile) {
     return $cacheData;
 }
 
-$cacheData = getOrGenerateProjectsCache($selectedOrg, $orgPath, $cacheFile);
+$cacheData = getOrGenerateProjectsCache($selectedOrg, $orgPath, $cacheFile, $isExport);
 
-// Pobierz listę wszystkich dostępnych organizacji na serwerze
-$allAvailableOrgs = [];
-if (is_dir($baseGithubDir)) {
-    foreach (scandir($baseGithubDir) as $d) {
-        if ($d !== '.' && $d !== '..' && strpos($d, '.') !== 0 && is_dir($baseGithubDir . '/' . $d)) {
-            $allAvailableOrgs[] = $d;
-        }
-    }
+// Zawsze udostępniaj pełną listę zdefiniowanych, aktywnych serwisów WWW
+$allAvailableOrgs = [
+    'autogrammar', 'bioxfoundry', 'digitaltwin-run', 'emllm', 'fin-officer',
+    'founder-pl', 'oqlos', 'semcod', 'stream-ware', 'tom-sapletta-com',
+    'urirun-connectors', 'wellmanifest', 'wronai'
+];
+
+if (!in_array($selectedOrg, $allAvailableOrgs) && !in_array($selectedOrg, $invalidOrgs)) {
+    $allAvailableOrgs[] = $selectedOrg;
 }
 sort($allAvailableOrgs);
 ?>
@@ -185,12 +350,12 @@ sort($allAvailableOrgs);
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>WebOrg — <?php echo htmlspecialchars(strtoupper($selectedOrg)); ?> Hub Projektów</title>
   <meta name="description" content="Uniwersalny, jednoplikowy portal landing page dla organizacji GitHub z automatycznym 24h cache, diagramem zależności i podglądem zadań.">
-  
+
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600&family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;600;700;800&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css" crossorigin="anonymous" />
-  
+
   <script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.28.1/cytoscape.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.0/marked.min.js"></script>
 
@@ -223,16 +388,16 @@ sort($allAvailableOrgs);
     h1, h2, h3, h4 { font-family: var(--font-heading); font-weight: 700; }
     .gradient-text { background: var(--gradient-primary); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
     a { color: var(--accent-cyan); text-decoration: none; }
-    
+
     .navbar { position: sticky; top: 0; z-index: 100; background: var(--glass-bg); backdrop-filter: blur(16px); border-bottom: 1px solid var(--glass-border); padding: 1rem 2rem; display: flex; align-items: center; justify-content: space-between; gap: 1.5rem; }
     .nav-brand { display: flex; align-items: center; gap: 0.75rem; font-family: var(--font-heading); font-size: 1.35rem; font-weight: 800; }
     .brand-icon { width: 38px; height: 38px; background: var(--gradient-primary); border-radius: 8px; display: flex; align-items: center; justify-content: center; color: #fff; font-size: 1.2rem; }
-    
+
     .org-selector-select { background: rgba(30, 41, 59, 0.8); border: 1px solid var(--glass-border); color: #fff; padding: 0.4rem 0.8rem; border-radius: 20px; font-family: var(--font-body); font-weight: 600; outline: none; cursor: pointer; }
     .search-box { position: relative; flex: 1; max-width: 420px; }
     .search-input { width: 100%; padding: 0.65rem 1rem 0.65rem 2.6rem; background: rgba(15, 23, 42, 0.7); border: 1px solid var(--glass-border); border-radius: 30px; color: #fff; outline: none; }
     .search-icon { position: absolute; left: 1rem; top: 50%; transform: translateY(-50%); color: var(--text-muted); }
-    
+
     .cache-status-widget { display: flex; align-items: center; gap: 0.6rem; background: rgba(30, 41, 59, 0.6); border: 1px solid var(--glass-border); padding: 0.4rem 0.9rem; border-radius: 30px; font-size: 0.82rem; }
     .status-dot { width: 8px; height: 8px; border-radius: 50%; background: #10b981; box-shadow: 0 0 8px #10b981; }
 

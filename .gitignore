@@ -6,3 +6,9 @@ cache_*.json
 .DS_Store
 *.log
 .env
+
+# Isolated delivery worktrees and local receipts
+/.worktrees/
+/.subactor/
+/_site/
+/tests/__pycache__/
